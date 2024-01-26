@@ -1,0 +1,304 @@
+response_code = ""
+  
+// Function to display information with timestamp
+def displayInfo(String title) {
+    def date = new Date().format("dd-MM-yyyy HH:mm:SS", TimeZone.getTimeZone('UTC'))
+    echo "################# ${title} #################"
+    println date
+    echo "Release: ${env.RELEASE_VERSION}"
+    echo "Package: ${env.ARTIFACT_NAME}"
+    echo "New: ${new_release}"
+}
+   
+// Function to perform package download
+def downloadPackage() {
+    displayInfo("Package Download")
+    echo "Removing previous packages..."
+    sh 'rm -f abc-webapp-*.tar.gz'
+    echo "Package ${env.ARTIFACT_NAME} downloading..."
+    sh """
+        aws s3 cp s3://abc-dev-app-artifact/${env.ARTIFACT_NAME} .
+        pwd
+        ls -lah
+    """
+}
+   
+// Function to copy to server
+def copyToServer(String server) {
+    sshagent(credentials: ['abc_dev_jenkins']) {
+        displayInfo("Copy to ${server} server")
+        sh """
+            scp ${env.ARTIFACT_NAME} ${env.USERNAME}@${server}:${env.BASE}/pkgs/;
+            ssh -o StrictHostKeyChecking=no -tt ${env.USERNAME}@${server} 'uptime; \
+                tar -xzvf ${env.BASE}/pkgs/${env.ARTIFACT_NAME} -C ${env.BASE}/opt/abc/releases/; \
+                ls -lah ${env.BASE}/opt/abc/releases/';
+        """
+    }
+}
+   
+// Function to deploy on server
+def deployOnServer(String server) {
+    sshagent(credentials: ['abc_dev_jenkins']) {
+        displayInfo("Deploy to ${server} server")
+        sh """
+            ssh -o StrictHostKeyChecking=no -tt ${env.USERNAME}@${server} 'uptime; \
+                echo "Stopping tomcat..."; \
+                sudo systemctl stop abc-tomcat; \
+                cd ${env.BASE}/opt/abc; \
+                rm current.war; \
+                ln -s releases/${env.RELEASE_VERSION}/${env.RELEASE_VERSION}.war current.war; \
+                cp -pr ${env.BASE}/var/tomcat/webapps/abc ${env.BASE}/var/tomcat/webapps/abc-\$(date '+%d%m%Y'); \
+                rm -rf ${env.BASE}/var/tomcat/webapps/abc/*; \
+                cd ${env.BASE}/var/tomcat/webapps/abc/; \
+                unzip /${env.BASE}/opt/abc/releases/${env.RELEASE_VERSION}/${env.RELEASE_VERSION}.war; \
+                echo "Starting tomcat..."; \
+                sudo systemctl start abc-tomcat; \
+                sleep 60;';
+        """
+    }
+}
+   
+// Function to perform health check
+def healthCheck(String server) {
+    def url = "http://${server}:8080/abc/status"
+   
+    displayInfo("HealthCheck of ${server} server")
+    while (response_code != "200")
+    {
+        response_code = sh(script: """
+            curl_response=\$(curl -sL -w '%{http_code}' ${url} -o /dev/null);
+            if [ "\${curl_response}" != "200" ];
+            then
+                sleep 15s;
+            fi;
+            echo "\${curl_response}";
+        """, returnStdout: true).trim()
+   
+        echo "HTTP response status code: ${response_code}"
+    }
+}
+ 
+// Pipeline definition
+pipeline {
+    agent any
+    environment {
+        RELEASE_VERSION = "abc-webapp-${release_version}"
+        ARTIFACT_NAME = "${env.RELEASE_VERSION}.tar.gz"
+ 
+        BASE = "/export/home/apps/abc"
+        USERNAME = "psadmin"
+        DEV_APP_01 = "abc1-app-01.xyz-dev.ggg.com"
+        CRT_APP_01 = "abc2-app-01.xyz-dev.ggg.com"
+        STG_APP_01 = "abc3-app-01.xyz-dev.ggg.com"
+        STG_APP_02 = "abc4-app-01.xyz-dev.ggg.com"
+    }
+    parameters {
+        validatingString(
+            name: 'release_version',
+            defaultValue: '',
+            regex: /^[0-9]+.[0-9]+.[0-9]+$/,
+            failedValidationMessage: 'Please refer to the example in description.',
+            description: 'Example: 9.4.1'
+        )
+        booleanParam(
+            name: 'new_release',
+            defaultValue: true,
+            description: 'If True, the package will get downloaded from the S3 bucket. If False, the package should reside on the cluster. Default is \'True\'.'
+        )
+    }
+    stages {
+        stage('Release Info') {
+            steps {
+                script {
+                    displayInfo("Release Info")
+                }
+            }
+        }
+        stage('Package Download') {
+            when {
+                expression {
+                    return params.new_release
+                }
+            }
+            steps {
+                script {
+                    downloadPackage()
+                }
+            }
+        }
+        stage('DEV Copy') {
+            when {
+                expression {
+                    return params.new_release
+                }
+            }
+            steps {
+                script {
+                    copyToServer(env.DEV_APP_01)
+                }
+            }
+        }
+        stage('DEV Deploy') {
+            input {
+                message "Do you want to proceed for DEV deployment?"
+            }
+            steps {
+                script {
+                    deployOnServer(env.DEV_APP_01)
+                }
+            }
+        }
+        stage('DEV HealthCheck') {
+            steps {
+                script {
+                    healthCheck(env.DEV_APP_01)
+                }
+            }
+        }
+        stage('CERT Copy') {
+            when {
+                allOf {
+                    expression {
+                        return params.new_release
+                    }
+                    equals(actual: response_code, expected: "200")
+                }
+            }
+            steps {
+                echo "HTTP response status code: ${response_code}"
+                script {
+                    copyToServer(env.CRT_APP_01)
+                }
+            }
+        }
+        stage('CERT Deploy') {
+            when {
+                beforeInput true
+                equals(actual: response_code, expected: "200")
+            }
+            input {
+                message "Do you want to proceed for CERT deployment?"
+            }
+            steps {
+                echo "HTTP response status code: ${response_code}"
+                script {
+                    deployOnServer(env.CRT_APP_01)
+                }
+            }
+        }
+        stage('CERT HealthCheck') {
+            steps {
+                script {
+                    healthCheck(env.CRT_APP_01)
+                }
+            }
+        }
+        stage('STG Node-1 Copy') {
+            when {
+                allOf {
+                    expression {
+                        return params.new_release
+                    }
+                    equals(actual: response_code, expected: "200")
+                }
+            }
+            steps {
+                echo "HTTP response status code: ${response_code}"
+                script {
+                    copyToServer(env.STG_APP_01)
+                }
+            }
+        }
+        stage('STG Node-1 Deploy') {
+            when {
+                beforeInput true
+                equals(actual: response_code, expected: "200")
+            }
+            input {
+                message "Do you want to proceed for STG Node-1 deployment?"
+            }
+            steps {
+                echo "HTTP response status code: ${response_code}"
+                script {
+                    deployOnServer(env.STG_APP_01)
+                }
+            }
+        }
+        stage('STG Node-1 HealthCheck') {
+            steps {
+                script {
+                    healthCheck(env.STG_APP_01)
+                }
+            }
+        }
+        stage('STG Node-2 Copy') {
+            when {
+                allOf {
+                    expression {
+                        return params.new_release
+                    }
+                    equals(actual: response_code, expected: "200")
+                }
+            }
+            steps {
+                echo "HTTP response status code: ${response_code}"
+                script {
+                    copyToServer(env.STG_APP_02)
+                }
+            }
+        }
+        stage('STG Node-2 Deploy') {
+            when {
+                beforeInput true
+                equals(actual: response_code, expected: "200")
+            }
+            input {
+                message "Do you want to proceed for STG Node-2 deployment?"
+            }
+            steps {
+                echo "HTTP response status code: ${response_code}"
+                script {
+                    deployOnServer(env.STG_APP_02)
+                }
+            }
+        }
+        stage('STG Node-2 HealthCheck') {
+            steps {
+                script {
+                    healthCheck(env.STG_APP_02)
+                }
+            }
+        }
+/*
+        stage('PRD Job Initiate') {
+            when {
+                beforeInput true
+                equals(actual: response_code, expected: "200")
+            }
+            input {
+                message "Do you want to initiate PRD deployment job?"
+            }
+            steps {
+                echo "HTTP response status code: ${response_code}"
+                script {
+                    def date = new Date().format("dd-MM-yyyy HH:mm:SS", TimeZone.getTimeZone('UTC'))
+ 
+                    displayInfo("Initiate PRD deployment job", """
+                        Initiate PRD deployment job
+                        Release Version: ${params.release_version}
+                        New Release: ${params.new_release}
+                    """)
+                     
+                    build job: "ABC-Deploy-Prod", wait: true,
+                        parameters: [
+                            string(name: "release_version", value: "${params.release_version}"),
+                            booleanParam(name: "new_release", value: "${params.new_release}")
+                        ]
+                     
+                    println date
+                }
+            }
+        }
+*/
+    }
+}
