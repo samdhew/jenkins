@@ -64,7 +64,3 @@ The Jenkins pipeline is defined with the following stages:
 2. Create a new Jenkins pipeline job and link it to the Git repository containing these DSL scripts.
 3. Configure job parameters as needed, specifying the release version and whether it's a new release.
 4. Run the pipeline, monitoring the progress on the Jenkins dashboard.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
